@@ -477,17 +477,122 @@ fn show_tag(status: &adw::StatusPage, reader: &ReaderId, tag: &TagInfo) {
     status.set_title(&format!("UID  {}", hex(&tag.uid)));
 
     let mut lines = Vec::new();
-    lines.push(format!("Reader: {}", reader.key));
+    let push = |lines: &mut Vec<String>, label: &str, value: &str| {
+        lines.push(format!("{:<8}{}", format!("{}:", label), value));
+    };
+
+    push(&mut lines, "Reader", &reader.key);
+    if let Some(t) = tag_type_label(tag.sak, &tag.atr) {
+        push(&mut lines, "Type", t);
+    }
+    if let Some(m) = manufacturer_label(&tag.uid) {
+        push(&mut lines, "Maker", m);
+    }
+    push(&mut lines, "Size", uid_size_label(tag.uid.len()));
     if let Some(atqa) = tag.atqa {
-        lines.push(format!("ATQA: {:02X} {:02X}", atqa[0], atqa[1]));
+        push(&mut lines, "ATQA", &format!("{:02X} {:02X}", atqa[0], atqa[1]));
     }
     if let Some(sak) = tag.sak {
-        lines.push(format!("SAK:  {:02X}", sak));
+        push(&mut lines, "SAK", &format!("{:02X}", sak));
     }
     if !tag.atr.is_empty() {
-        lines.push(format!("ATR:  {}", hex(&tag.atr)));
+        push(&mut lines, "ATR", &hex(&tag.atr));
     }
     status.set_description(Some(&lines.join("\n")));
+}
+
+/// Friendly tag-type string. Prefers the SAK byte when libnfc gave us one
+/// (most specific signal); otherwise pulls the card-name code out of the
+/// PC/SC ATR's PC/SC Part 3 Annex A historical-bytes block.
+fn tag_type_label(sak: Option<u8>, atr: &[u8]) -> Option<&'static str> {
+    if let Some(s) = sak {
+        return Some(sak_to_label(s));
+    }
+    pcsc_atr_card_name(atr)
+}
+
+/// SAK byte → tag family. Values from NXP AN10833 + ISO/IEC 14443-3.
+/// "Cascade" SAKs (bit 0x04 set) mean anticollision is incomplete and the
+/// caller should re-anticol — we shouldn't normally see those here.
+fn sak_to_label(sak: u8) -> &'static str {
+    match sak {
+        0x00 => "MIFARE Ultralight / NTAG",
+        0x08 => "MIFARE Classic 1K",
+        0x09 => "MIFARE Mini",
+        0x10 => "MIFARE Plus 2K (SL2)",
+        0x11 => "MIFARE Plus 4K (SL2)",
+        0x18 => "MIFARE Classic 4K",
+        0x19 => "MIFARE Classic 2K",
+        0x20 => "ISO 14443-4 (DESFire / JCOP / smartcard)",
+        0x28 => "ISO 14443-4 with MIFARE emulation (Plus SL1)",
+        0x38 => "ISO 14443-4, proprietary",
+        0x88 => "MIFARE Classic 1K (Infineon)",
+        0x98 => "MPCOS (Gemplus)",
+        _ => "unrecognised SAK",
+    }
+}
+
+/// Decode the PC/SC contactless ATR's "Card Name" code. The format
+/// (per PC/SC Part 3 Annex A) embeds an AID prefix `A0 00 00 03 06`
+/// followed by a Standard byte and a 2-byte Card Name code in the
+/// historical bytes. Find the prefix and read the next 3 bytes.
+fn pcsc_atr_card_name(atr: &[u8]) -> Option<&'static str> {
+    let prefix = [0xA0, 0x00, 0x00, 0x03, 0x06];
+    let pos = atr.windows(prefix.len()).position(|w| w == prefix)?;
+    let standard = *atr.get(pos + 5)?;
+    let name_hi = *atr.get(pos + 6)?;
+    let name_lo = *atr.get(pos + 7)?;
+    let name = u16::from_be_bytes([name_hi, name_lo]);
+    pcsc_card_name(standard, name)
+}
+
+fn pcsc_card_name(standard: u8, name: u16) -> Option<&'static str> {
+    // standard 0x03 = ISO/IEC 14443A part 3, 0x11 = FeliCa, 0x00 = no info.
+    match (standard, name) {
+        (0x03, 0x0001) => Some("MIFARE Classic 1K"),
+        (0x03, 0x0002) => Some("MIFARE Classic 4K"),
+        (0x03, 0x0003) => Some("MIFARE Ultralight"),
+        (0x03, 0x0026) => Some("MIFARE Mini"),
+        (0x03, 0x0036) => Some("MIFARE Plus SL1 2K"),
+        (0x03, 0x0037) => Some("MIFARE Plus SL1 4K"),
+        (0x03, 0x0038) => Some("MIFARE Plus SL2 2K"),
+        (0x03, 0x0039) => Some("MIFARE Plus SL2 4K"),
+        (0x03, 0x003A) => Some("MIFARE Ultralight C"),
+        (0x03, 0x003B) => Some("FeliCa Lite"),
+        (0x03, 0x003C) => Some("FeliCa Lite-S"),
+        (0x03, 0x0030) => Some("Topaz / Jewel"),
+        _ => None,
+    }
+}
+
+/// IC manufacturer from UID byte 0 (ISO/IEC 7816-6 / JTC1 SC17 registry).
+/// 0x08 isn't a manufacturer — it's the marker for a tag using a random
+/// UID rather than its hardware UID.
+fn manufacturer_label(uid: &[u8]) -> Option<&'static str> {
+    match uid.first()? {
+        0x02 => Some("ST Microelectronics"),
+        0x04 => Some("NXP Semiconductors"),
+        0x05 => Some("Infineon Technologies"),
+        0x07 => Some("Texas Instruments"),
+        0x08 => Some("(random UID)"),
+        0x16 => Some("EM Microelectronic"),
+        0x1D => Some("ASK / Atmel"),
+        0x21 => Some("EM Marin"),
+        0x28 => Some("LG-CNS"),
+        0x33 => Some("AMIC Technology"),
+        0x44 => Some("Gentag"),
+        0x47 => Some("ORGA"),
+        _ => None,
+    }
+}
+
+fn uid_size_label(len: usize) -> &'static str {
+    match len {
+        4 => "4-byte UID (single anticollision)",
+        7 => "7-byte UID (double anticollision)",
+        10 => "10-byte UID (triple anticollision)",
+        _ => "non-standard UID length",
+    }
 }
 
 fn format_dump(dump: &MifareDump) -> String {
