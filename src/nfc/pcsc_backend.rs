@@ -493,11 +493,12 @@ fn is_magic_ack(resp: &[u8]) -> bool {
 /// the PN532 register state — CRC handling is restored before we return,
 /// whether we succeeded or not.
 fn gen1a_unlock(card: &Card) -> Result<bool> {
-    // Stop the PN532 from auto-re-selecting the card mid-sequence.
-    // RFConfiguration CfgItem 5 = MaxRetries: passive-activation, channel,
-    // mifare-passive all set to 0.
-    pn532_transmit(card, &[0xD4, 0x32, 0x05, 0x00, 0x00, 0x00])
-        .context("PN532 RFConfiguration (no retries) failed")?;
+    // Do NOT set RFConfiguration MaxRetries here. On the ACR122U the PN532's
+    // register state survives PC/SC session teardown (only the RF field is
+    // cycled), so any non-default MaxRetries leaks into subsequent sessions
+    // and breaks polling — the LED stays red and new tags aren't detected
+    // until the reader is unplugged. libnfc's reference unlock doesn't
+    // touch MaxRetries either; the unlock works fine without it.
 
     // Disable hardware CRC on TX and RX. Bit 7 of CIU_TxMode/CIU_RxMode is
     // the CRC-enable flag; clearing it gives us raw frames for the unlock.
