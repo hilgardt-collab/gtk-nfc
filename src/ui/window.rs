@@ -26,6 +26,7 @@ struct UiState {
     stack: gtk::Stack,
     status_page: adw::StatusPage,
     dump_buffer: gtk::TextBuffer,
+    toast_overlay: adw::ToastOverlay,
 }
 
 impl UiState {
@@ -48,6 +49,28 @@ impl UiState {
     fn show_dump(&self, dump: &MifareDump) {
         self.dump_buffer.set_text(&format_dump(dump));
         self.stack.set_visible_child_name("dump");
+    }
+
+    fn show_toast(&self, message: &str) {
+        let toast = adw::Toast::new(message);
+        toast.set_timeout(5);
+        self.toast_overlay.add_toast(toast);
+    }
+
+    /// Re-parse the editable dump buffer back into a MifareDump. The
+    /// `current_dump` in memory is the source for sector-read metadata
+    /// (since user edits don't tell us anything new about which keys
+    /// authed); the parsed bytes come from whatever the user has typed.
+    /// Returns an error if no dump is loaded or if the buffer text is
+    /// malformed.
+    fn parse_buffer(&self) -> anyhow::Result<MifareDump> {
+        let base_ref = self.current_dump.borrow();
+        let base = base_ref
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no dump loaded"))?;
+        let (start, end) = self.dump_buffer.bounds();
+        let text = self.dump_buffer.text(&start, &end, false);
+        parse_dump_text(text.as_str(), base)
     }
 }
 
@@ -134,7 +157,7 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
 
     let dump_buffer = gtk::TextBuffer::new(None);
     let dump_view = gtk::TextView::builder()
-        .editable(false)
+        .editable(true)
         .monospace(true)
         .top_margin(12)
         .bottom_margin(12)
@@ -160,10 +183,16 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
     content_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     content_box.append(&stack);
 
+    // Toast overlay sits between the content box and the navigation page so
+    // we can surface parse errors etc. without flipping the stack to the
+    // status view (which would visually clobber the user's edits).
+    let toast_overlay = adw::ToastOverlay::new();
+    toast_overlay.set_child(Some(&content_box));
+
     let content_page = adw::NavigationPage::builder()
         .title("Tag")
         .tag("tag")
-        .child(&content_box)
+        .child(&toast_overlay)
         .build();
 
     let split = adw::NavigationSplitView::builder()
@@ -189,6 +218,7 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
         stack: stack.clone(),
         status_page: status_page.clone(),
         dump_buffer: dump_buffer.clone(),
+        toast_overlay: toast_overlay.clone(),
     });
 
     let row_ids: Rc<RefCell<Vec<ReaderId>>> = Rc::new(RefCell::new(Vec::new()));
@@ -247,11 +277,7 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
             dialog.open(Some(&window), gtk::gio::Cancellable::NONE, move |res| {
                 let Ok(file) = res else { return };
                 let Some(path) = file.path() else {
-                    state.show_status(
-                        "dialog-warning-symbolic",
-                        "Couldn't load",
-                        "The selected file has no local path.",
-                    );
+                    state.show_toast("Couldn't load: selected file has no local path");
                     return;
                 };
                 match load_dump(&path) {
@@ -260,11 +286,7 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
                         *state.current_dump.borrow_mut() = Some(dump);
                         state.refresh_buttons();
                     }
-                    Err(e) => state.show_status(
-                        "dialog-warning-symbolic",
-                        "Couldn't load dump",
-                        &e.to_string(),
-                    ),
+                    Err(e) => state.show_toast(&format!("Couldn't load dump: {}", e)),
                 }
             });
         });
@@ -274,9 +296,12 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
         let state = Rc::clone(&state);
         let window = window.clone();
         save_btn.connect_clicked(move |_| {
-            let dump_bytes = match state.current_dump.borrow().as_ref() {
-                Some(d) => d.bytes.clone(),
-                None => return,
+            let dump_bytes = match state.parse_buffer() {
+                Ok(d) => d.bytes,
+                Err(e) => {
+                    state.show_toast(&format!("Can't save: {}", e));
+                    return;
+                }
             };
             let dialog = gtk::FileDialog::builder()
                 .title("Save .mfd dump")
@@ -287,19 +312,11 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
             dialog.save(Some(&window), gtk::gio::Cancellable::NONE, move |res| {
                 let Ok(file) = res else { return };
                 let Some(path) = file.path() else {
-                    state.show_status(
-                        "dialog-warning-symbolic",
-                        "Couldn't save",
-                        "The chosen location has no local path.",
-                    );
+                    state.show_toast("Couldn't save: chosen location has no local path");
                     return;
                 };
                 if let Err(e) = std::fs::write(&path, &dump_bytes) {
-                    state.show_status(
-                        "dialog-warning-symbolic",
-                        "Couldn't save dump",
-                        &e.to_string(),
-                    );
+                    state.show_toast(&format!("Couldn't save dump: {}", e));
                 }
             });
         });
@@ -312,9 +329,12 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
                 Some(r) => r,
                 None => return,
             };
-            let dump = match state.current_dump.borrow().clone() {
-                Some(d) => d,
-                None => return,
+            let dump = match state.parse_buffer() {
+                Ok(d) => d,
+                Err(e) => {
+                    state.show_toast(&format!("Can't write: {}", e));
+                    return;
+                }
             };
             state.worker.send(Command::WriteDump { reader, dump });
         });
@@ -625,6 +645,72 @@ fn format_dump(dump: &MifareDump) -> String {
         s.push('\n');
     }
     s
+}
+
+/// Parse the editable dump TextView back into a MifareDump.
+///
+/// The buffer normally holds whatever `format_dump` produced, optionally
+/// hand-edited. We only look at lines whose trimmed form starts with
+/// `NN: <16 hex bytes>` (decimal block index 00..63); everything else
+/// (UID/Size headers, "Sector NN — key ..." labels, blank lines, user
+/// comments) is ignored. Strict on what we accept inside a block line:
+/// must be exactly 16 whitespace-separated hex bytes, and each block
+/// 0..=63 must appear exactly once.
+fn parse_dump_text(text: &str, base: &MifareDump) -> anyhow::Result<MifareDump> {
+    let mut bytes = vec![0u8; MifareDump::SIZE_1K];
+    let mut seen = [false; 64];
+
+    for (lineno, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        let Some(colon) = trimmed.find(':') else { continue };
+        let prefix = &trimmed[..colon];
+        let Ok(block) = prefix.parse::<usize>() else { continue };
+        if block >= 64 {
+            continue;
+        }
+        if seen[block] {
+            anyhow::bail!("line {}: block {:02} appears twice", lineno + 1, block);
+        }
+
+        let rest = trimmed[colon + 1..].trim();
+        let chunks: Vec<&str> = rest.split_whitespace().collect();
+        if chunks.len() != 16 {
+            anyhow::bail!(
+                "line {}: block {:02} has {} hex byte(s), expected 16",
+                lineno + 1,
+                block,
+                chunks.len()
+            );
+        }
+        let off = block * 16;
+        for (i, c) in chunks.iter().enumerate() {
+            bytes[off + i] = u8::from_str_radix(c, 16).map_err(|_| {
+                anyhow::anyhow!(
+                    "line {}: block {:02} byte {}: not hex ({:?})",
+                    lineno + 1,
+                    block,
+                    i,
+                    c
+                )
+            })?;
+        }
+        seen[block] = true;
+    }
+
+    if let Some(missing) = (0..64u8).find(|b| !seen[*b as usize]) {
+        let total = (0..64u8).filter(|b| !seen[*b as usize]).count();
+        anyhow::bail!(
+            "{} block(s) missing from dump (first missing: {:02})",
+            total,
+            missing
+        );
+    }
+
+    Ok(MifareDump {
+        uid: bytes[0..4].to_vec(),
+        bytes,
+        sectors: base.sectors.clone(),
+    })
 }
 
 fn load_dump(path: &PathBuf) -> anyhow::Result<MifareDump> {
