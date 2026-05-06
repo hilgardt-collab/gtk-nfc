@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -39,6 +39,12 @@ struct UiState {
     // changes; None when no reader is selected or selection is libnfc
     // (we only watch PC/SC, see watcher.rs).
     watcher: RefCell<Option<ReaderWatcher>>,
+    // When true, format_dump appends keyA/keyB/access-bits annotation
+    // lines after each sector trailer. Toggled live via the Decode
+    // button; off → cleaner hex-only view. parse_dump_text ignores the
+    // annotation lines (they don't start with "NN:") so toggling is
+    // non-destructive on byte content.
+    show_decoded: Cell<bool>,
 }
 
 impl UiState {
@@ -63,9 +69,24 @@ impl UiState {
     }
 
     fn show_dump(&self, dump: &MifareDump) {
-        self.dump_buffer.set_text(&format_dump(dump));
+        self.dump_buffer
+            .set_text(&format_dump(dump, self.show_decoded.get()));
         self.dump_page.set_visible(true);
         self.view_stack.set_visible_child_name("dump");
+    }
+
+    /// Re-render the dump buffer with the current decode flag, preserving
+    /// the user's hex byte edits. Inline comments / non-byte content the
+    /// user typed are lost on toggle (the parser only tracks block lines),
+    /// but that's the cost of getting decoded annotations to refresh.
+    /// Silent no-op if the buffer doesn't currently parse — the user
+    /// needs to fix it before toggling has anywhere to go.
+    fn redraw_dump(&self) {
+        if let Ok(dump) = self.parse_buffer() {
+            self.dump_buffer
+                .set_text(&format_dump(&dump, self.show_decoded.get()));
+            *self.current_dump.borrow_mut() = Some(dump);
+        }
     }
 
     fn show_toast(&self, message: &str) {
@@ -180,6 +201,12 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
         b.set_sensitive(false);
     }
 
+    let decode_btn = gtk::ToggleButton::builder()
+        .label("Decode")
+        .tooltip_text("Show keys, access bits, and GPB inline in the dump view")
+        .active(true)
+        .build();
+
     let action_bar = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
@@ -195,6 +222,7 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
         .orientation(gtk::Orientation::Horizontal)
         .build();
     action_bar.append(&spacer);
+    action_bar.append(&decode_btn);
     action_bar.append(&load_btn);
     action_bar.append(&save_btn);
     action_bar.append(&write_btn);
@@ -291,6 +319,7 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
         dump_list: dump_list.clone(),
         dump_paths: RefCell::new(Vec::new()),
         watcher: RefCell::new(None),
+        show_decoded: Cell::new(true),
     });
 
     let row_ids: Rc<RefCell<Vec<ReaderId>>> = Rc::new(RefCell::new(Vec::new()));
@@ -454,6 +483,14 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
             };
             state.suspend_watcher();
             state.worker.send(Command::WriteDump { reader, dump });
+        });
+    }
+
+    {
+        let state = Rc::clone(&state);
+        decode_btn.connect_toggled(move |btn| {
+            state.show_decoded.set(btn.is_active());
+            state.redraw_dump();
         });
     }
 
@@ -802,7 +839,7 @@ fn uid_size_label(len: usize) -> &'static str {
     }
 }
 
-fn format_dump(dump: &MifareDump) -> String {
+fn format_dump(dump: &MifareDump, decode: bool) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "UID: {}", hex(&dump.uid));
     let _ = writeln!(s, "Size: {} bytes (MIFARE Classic 1K)", dump.bytes.len());
@@ -828,10 +865,148 @@ fn format_dump(dump: &MifareDump) -> String {
                 break;
             }
             let _ = writeln!(s, "  {:02}: {}", block, hex(&dump.bytes[off..off + 16]));
+            // After the trailer block, optionally emit decoded annotations.
+            if decode && b == 3 {
+                for line in format_trailer_decoded(&dump.bytes[off..off + 16]) {
+                    let _ = writeln!(s, "{}", line);
+                }
+            }
         }
         s.push('\n');
     }
     s
+}
+
+/// Decoded MIFARE Classic sector trailer info: keys A/B, the four
+/// access bytes parsed into per-block (c1,c2,c3) tuples, and an
+/// integrity flag (the 12 access bits are also stored inverted in
+/// bytes 6 and 7 to detect corruption).
+#[derive(Debug, Clone, Copy)]
+struct AccessBits {
+    /// (c1, c2, c3) for sector blocks 0..=3. Index 3 is the trailer
+    /// itself, which uses a different access-mode table from the
+    /// data blocks.
+    blocks: [(u8, u8, u8); 4],
+    /// True if the inverted bits in bytes 6 and 7 complement the
+    /// non-inverted bits in bytes 7 and 8 — i.e. the trailer is
+    /// internally consistent. False means corrupted access bytes,
+    /// which a real card would reject.
+    integrity_ok: bool,
+    gpb: u8,
+}
+
+/// Decode the four access-control bytes (bytes 6..9 of a sector
+/// trailer). Layout per NXP MF1ICS50 datasheet:
+///   byte 6 = ~c2_3..0  ~c1_3..0     (high nibble = inverted C2 for blocks 3..0)
+///   byte 7 =  c1_3..0  ~c3_3..0     (high nibble = C1 for blocks 3..0)
+///   byte 8 =  c3_3..0   c2_3..0     (high nibble = C3 for blocks 3..0)
+///   byte 9 = General Purpose Byte (no access control function)
+fn decode_access_bits(b: [u8; 4]) -> AccessBits {
+    let c1 = b[1] >> 4;
+    let c2 = b[2] & 0x0F;
+    let c3 = b[2] >> 4;
+
+    let inv_c1 = b[0] & 0x0F;
+    let inv_c2 = b[0] >> 4;
+    let inv_c3 = b[1] & 0x0F;
+
+    let integrity_ok =
+        (c1 ^ inv_c1) == 0xF && (c2 ^ inv_c2) == 0xF && (c3 ^ inv_c3) == 0xF;
+
+    let mut blocks = [(0u8, 0u8, 0u8); 4];
+    for (i, slot) in blocks.iter_mut().enumerate() {
+        let mask = 1 << i;
+        *slot = (
+            ((c1 & mask) != 0) as u8,
+            ((c2 & mask) != 0) as u8,
+            ((c3 & mask) != 0) as u8,
+        );
+    }
+    AccessBits {
+        blocks,
+        integrity_ok,
+        gpb: b[3],
+    }
+}
+
+/// Map a (c1,c2,c3) tuple from a *data* block to its access mode.
+/// Per NXP MF1ICS50 §8.6.3 — the same triple means different things
+/// for data blocks versus the trailer (see `trailer_access_label`).
+fn data_block_access_label(c: (u8, u8, u8)) -> &'static str {
+    match c {
+        (0, 0, 0) => "A|B read/write/inc/dec (transport)",
+        (0, 1, 0) => "A|B read only",
+        (1, 0, 0) => "A|B read, B write",
+        (1, 1, 0) => "A|B read, B write/inc/dec",
+        (0, 0, 1) => "A|B read+dec, no write",
+        (0, 1, 1) => "B read/write",
+        (1, 0, 1) => "B read only",
+        (1, 1, 1) => "no access",
+        _ => "invalid",
+    }
+}
+
+fn trailer_access_label(c: (u8, u8, u8)) -> &'static str {
+    match c {
+        (0, 0, 0) => "keyA never read; A writes keys+bits; B reads/writes by A",
+        (0, 1, 0) => "keys+bits readable by A only; nothing writable",
+        (1, 0, 0) => "B writes keys+bits; bits readable by A|B",
+        (1, 1, 0) => "bits readable by A|B; nothing writable",
+        (0, 0, 1) => "transport: A reads/writes keys+bits, B by A",
+        (0, 1, 1) => "B writes keys+bits; bits readable by A|B; B writes bits",
+        (1, 0, 1) => "bits writable by B; nothing else writable",
+        (1, 1, 1) => "bits readable by A|B; nothing writable",
+        _ => "invalid",
+    }
+}
+
+/// Build the 1-2 annotation lines that follow a sector trailer in the
+/// decoded dump view. Lines are deliberately indented and start with
+/// non-digit text so `parse_dump_text` skips them on save/write.
+fn format_trailer_decoded(trailer: &[u8]) -> Vec<String> {
+    if trailer.len() != 16 {
+        return vec!["      (trailer truncated)".to_string()];
+    }
+    let key_a: String = trailer[0..6].iter().map(|b| format!("{:02X}", b)).collect();
+    let key_b: String = trailer[10..16].iter().map(|b| format!("{:02X}", b)).collect();
+    let acl_bytes = [trailer[6], trailer[7], trailer[8], trailer[9]];
+    let bits = decode_access_bits(acl_bytes);
+
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "      keyA={}  keyB={}  GPB={:02X}",
+        key_a, key_b, bits.gpb
+    ));
+
+    if !bits.integrity_ok {
+        lines.push(format!(
+            "      access: ⚠ corrupted ({:02X} {:02X} {:02X}) — invert bits don't check",
+            acl_bytes[0], acl_bytes[1], acl_bytes[2]
+        ));
+        return lines;
+    }
+
+    // Recognise the factory transport pattern (FF 07 80) and label it.
+    if acl_bytes[0..3] == [0xFF, 0x07, 0x80] {
+        lines.push(format!(
+            "      access: transport defaults — data: {}; trailer: {}",
+            data_block_access_label(bits.blocks[0]),
+            trailer_access_label(bits.blocks[3]),
+        ));
+        return lines;
+    }
+
+    // Non-default: list each block's triple and meaning.
+    let fmt_triple = |c: (u8, u8, u8)| format!("{}{}{}", c.0, c.1, c.2);
+    lines.push(format!(
+        "      access: {:02X} {:02X} {:02X} — block0={} ({}), block1={} ({}), block2={} ({}), trailer={} ({})",
+        acl_bytes[0], acl_bytes[1], acl_bytes[2],
+        fmt_triple(bits.blocks[0]), data_block_access_label(bits.blocks[0]),
+        fmt_triple(bits.blocks[1]), data_block_access_label(bits.blocks[1]),
+        fmt_triple(bits.blocks[2]), data_block_access_label(bits.blocks[2]),
+        fmt_triple(bits.blocks[3]), trailer_access_label(bits.blocks[3]),
+    ));
+    lines
 }
 
 /// Parse the editable dump TextView back into a MifareDump.
