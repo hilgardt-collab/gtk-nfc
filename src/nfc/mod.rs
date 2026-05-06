@@ -131,7 +131,13 @@ pub enum Event {
     DumpError { reader: ReaderId, message: String },
     WriteStarted { reader: ReaderId },
     WriteProgress { reader: ReaderId, block: u8, total: u8 },
-    WriteComplete { reader: ReaderId, blocks_written: u8, blocks_skipped: u8, uid_changed: bool },
+    WriteComplete {
+        reader: ReaderId,
+        blocks_written: u8,
+        blocks_skipped: u8,
+        uid_changed: bool,
+        mode: WriteMode,
+    },
     WriteError { reader: ReaderId, message: String },
     BackendError { backend: BackendKind, message: String },
 }
@@ -171,6 +177,21 @@ pub struct WriteOutcome {
     /// True if the post-write block 0 read matches what we wrote — i.e.
     /// the destination really is a magic tag.
     pub uid_changed: bool,
+    pub mode: WriteMode,
+}
+
+/// Which write strategy the backend ended up using. Detected per write,
+/// not declared up-front, so the UI can surface the truth even when a
+/// blank turns out to be a different magic generation than expected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteMode {
+    /// Gen1a "UID-writable" backdoor: unauthenticated `0x40`/`0x43` unlock
+    /// followed by raw `0xA0`/data block writes. No keys needed.
+    Gen1aBackdoor,
+    /// Standard MIFARE auth + Update-Binary writes. Works on Gen2/CUID
+    /// (block 0 writable after auth) and on factory-keyed normal tags
+    /// for everything except the locked block 0.
+    StandardAuth,
 }
 
 /// Default keys to try in order — covers factory blanks, MAD sectors,
@@ -306,6 +327,7 @@ fn run(
                                 blocks_written: o.blocks_written,
                                 blocks_skipped: o.blocks_skipped,
                                 uid_changed: o.uid_changed,
+                                mode: o.mode,
                             },
                             Err(e) => Event::WriteError { reader: reader.clone(), message: e.to_string() },
                         }

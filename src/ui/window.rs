@@ -8,7 +8,7 @@ use gtk::glib;
 
 use crate::nfc::{
     self, Backend, Command, Event, KeyType, MifareDump, Reader, ReaderId, SectorRead, TagInfo,
-    Worker,
+    WriteMode, Worker,
 };
 
 /// All the per-window state the event loop needs to mutate. Held in `Rc`s
@@ -382,26 +382,51 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
                         blocks_written,
                         blocks_skipped,
                         uid_changed,
+                        mode,
                         ..
                     } => {
-                        let (icon, title) = if uid_changed && blocks_skipped == 0 {
-                            ("emblem-default-symbolic", "Wrote tag")
-                        } else if !uid_changed {
-                            ("dialog-warning-symbolic", "Write didn't take")
-                        } else {
-                            ("dialog-warning-symbolic", "Wrote tag with skipped sectors")
+                        let mode_label = match mode {
+                            WriteMode::Gen1aBackdoor => "Gen1a backdoor",
+                            WriteMode::StandardAuth => "Gen2 / standard auth",
                         };
-                        let desc = if uid_changed {
-                            format!(
-                                "{} block(s) written, {} skipped (auth failed on destination).",
-                                blocks_written, blocks_skipped
+                        let (icon, title, desc) = if !uid_changed {
+                            // Block 0 didn't round-trip. Either the standard-auth
+                            // path ran (so Gen1a unlock didn't ACK and the tag
+                            // isn't Gen2 either — likely a non-magic blank), or
+                            // we somehow got the verify auth wrong. Either way:
+                            // the destination didn't accept the new UID.
+                            (
+                                "dialog-warning-symbolic",
+                                "Write didn't take",
+                                format!(
+                                    "Wrote {} block(s) via {} but block 0 didn't change. \
+                                     The destination isn't a writable magic blank, or its \
+                                     keys differ from the dump. Use a Gen1a or Gen2 blank.",
+                                    blocks_written, mode_label
+                                ),
+                            )
+                        } else if blocks_skipped == 0 {
+                            (
+                                "emblem-default-symbolic",
+                                match mode {
+                                    WriteMode::Gen1aBackdoor => "Wrote tag (Gen1a)",
+                                    WriteMode::StandardAuth => "Wrote tag (Gen2)",
+                                },
+                                format!(
+                                    "All {} blocks written via {}. UID confirmed.",
+                                    blocks_written, mode_label
+                                ),
                             )
                         } else {
-                            format!(
-                                "Wrote {} block(s) but block 0 didn't change — \
-                                 the destination isn't a Gen2 magic tag. \
-                                 Use a CUID/Gen2 blank.",
-                                blocks_written
+                            (
+                                "dialog-warning-symbolic",
+                                "Wrote tag with skipped blocks",
+                                format!(
+                                    "{} block(s) written, {} skipped via {}. \
+                                     UID changed but some blocks rejected the write \
+                                     (typically auth-key mismatch on a partial blank).",
+                                    blocks_written, blocks_skipped, mode_label
+                                ),
                             )
                         };
                         state.show_status(icon, title, &desc);

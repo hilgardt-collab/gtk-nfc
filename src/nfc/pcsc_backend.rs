@@ -8,7 +8,8 @@ use anyhow::{anyhow, Context as _, Result};
 use pcsc::{Card, Context, Disposition, Protocols, Scope, ShareMode};
 
 use super::{
-    Backend, BackendKind, KeyType, MifareDump, Reader, ReaderId, SectorRead, TagInfo, WriteOutcome,
+    Backend, BackendKind, KeyType, MifareDump, Reader, ReaderId, SectorRead, TagInfo, WriteMode,
+    WriteOutcome,
 };
 
 pub struct PcscBackend;
@@ -113,6 +114,15 @@ impl Backend for PcscBackend {
             ));
         }
 
+        // Try the Gen1a backdoor first. If the unlock ACKs we commit to the
+        // Gen1a path — the writes happen unauthenticated on the same
+        // session, and falling back mid-tag to standard auth would mix two
+        // strategies on the same blank. If the unlock doesn't ACK (or the
+        // reader can't even attempt it), fall through to standard auth.
+        if let Some(outcome) = try_gen1a_write(reader_name, dump, progress)? {
+            return Ok(outcome);
+        }
+
         let mut blocks_written = 0u8;
         let mut blocks_skipped = 0u8;
 
@@ -141,6 +151,7 @@ impl Backend for PcscBackend {
             blocks_written,
             blocks_skipped,
             uid_changed,
+            mode: WriteMode::StandardAuth,
         })
     }
 }
@@ -408,4 +419,230 @@ fn split_sw(resp: &[u8]) -> Result<(&[u8], [u8; 2])> {
     }
     let (data, sw) = resp.split_at(resp.len() - 2);
     Ok((data, [sw[0], sw[1]]))
+}
+
+// ===== Gen1a "UID-writable" backdoor support (ACR122U-only) ==================
+//
+// Gen1a magic tags accept an unauthenticated unlock sequence that puts them
+// into a state where any block — including the factory-locked block 0 — can
+// be written without keys. The sequence (mirroring libnfc's
+// `mifare_classic_unlock_card`) is:
+//
+//   1. HALT       (50 00 + CRC)
+//   2. 7-bit 0x40  → expect 4-bit ACK 0x0A
+//   3. 8-bit 0x43  → expect 8-bit ACK 0x0A
+//
+// PC/SC has no portable way to send 7-bit frames, so we do this through the
+// ACR122U's PN532 pseudo-APDU `FF 00 00 00 Lc <PN532-frame>`. The 7-bit
+// framing requirement means we have to twiddle the PN532's CIU registers
+// directly: CIU_TxMode/CIU_RxMode (0x6302/0x6303) for CRC handling, and
+// CIU_BitFraming (0x6333) for transmit-side bit length. Other PC/SC readers
+// don't expose these registers, so the dispatcher in
+// `write_mifare_classic_1k` only attempts Gen1a on readers whose name
+// contains "ACR122".
+
+/// True if the PC/SC reader name suggests it's an ACR122U or compatible
+/// (the only PC/SC reader we currently know how to drive raw enough to do
+/// the Gen1a unlock through).
+fn looks_like_acr122(reader_name: &str) -> bool {
+    reader_name.to_uppercase().contains("ACR122")
+}
+
+/// Send one PN532 frame as an ACR122U Direct Transmit pseudo-APDU
+/// (`FF 00 00 00 Lc <data>`) and return the response payload (the bytes
+/// before SW1SW2). 256-byte rx buffer — generous for any PN532 reply,
+/// since real frames here are well under 64 bytes.
+fn pn532_transmit(card: &Card, data: &[u8]) -> Result<Vec<u8>> {
+    if data.len() > 255 {
+        return Err(anyhow!("PN532 frame too long ({} bytes)", data.len()));
+    }
+    let mut apdu = Vec::with_capacity(5 + data.len());
+    apdu.extend_from_slice(&[0xFF, 0x00, 0x00, 0x00, data.len() as u8]);
+    apdu.extend_from_slice(data);
+
+    let mut rx = [0u8; 256];
+    let resp = card
+        .transmit(&apdu, &mut rx)
+        .context("PN532 pseudo-APDU transmit failed")?;
+    let (payload, sw) = split_sw(resp)?;
+    if sw != [0x90, 0x00] {
+        return Err(anyhow!(
+            "PN532 pseudo-APDU returned SW {:02X}{:02X}",
+            sw[0],
+            sw[1]
+        ));
+    }
+    Ok(payload.to_vec())
+}
+
+/// Did `pn532_transmit`'s reply look like a successful PN532
+/// `InCommunicateThru` (`D5 43 00 …`) carrying the magic ACK byte 0x0A?
+/// Used to recognise a Gen1a tag's responses to the unlock and the per-block
+/// write commands.
+fn is_magic_ack(resp: &[u8]) -> bool {
+    resp.len() >= 4 && resp[0] == 0xD5 && resp[1] == 0x43 && resp[2] == 0x00 && resp[3] == 0x0A
+}
+
+/// Run the Gen1a backdoor unlock on whatever tag is currently active in the
+/// session. Returns `Ok(true)` if both unlock steps got the magic ACK (so
+/// the tag is genuinely Gen1a), `Ok(false)` if a step NAK'd or returned an
+/// unexpected payload (so the tag isn't Gen1a — fall back to the standard
+/// path). `Err` only for transport-level failures talking to the reader.
+///
+/// This is deliberately self-contained: no caller-visible side effects on
+/// the PN532 register state — CRC handling is restored before we return,
+/// whether we succeeded or not.
+fn gen1a_unlock(card: &Card) -> Result<bool> {
+    // Stop the PN532 from auto-re-selecting the card mid-sequence.
+    // RFConfiguration CfgItem 5 = MaxRetries: passive-activation, channel,
+    // mifare-passive all set to 0.
+    pn532_transmit(card, &[0xD4, 0x32, 0x05, 0x00, 0x00, 0x00])
+        .context("PN532 RFConfiguration (no retries) failed")?;
+
+    // Disable hardware CRC on TX and RX. Bit 7 of CIU_TxMode/CIU_RxMode is
+    // the CRC-enable flag; clearing it gives us raw frames for the unlock.
+    pn532_transmit(card, &[0xD4, 0x08, 0x63, 0x02, 0x00, 0x63, 0x03, 0x00])
+        .context("PN532 WriteRegister (disable CRC) failed")?;
+
+    // Run the rest in a closure so we can guarantee CRC handling is
+    // restored on every exit path, even on error.
+    let outcome = (|| -> Result<bool> {
+        // HALT (50 00) plus its precomputed CRC_A. Real Gen1a tags NAK or
+        // ignore HALT; we don't care about the response — we just need the
+        // tag in HALT state for the unlock to take.
+        let _ = pn532_transmit(card, &[0xD4, 0x42, 0x50, 0x00, 0x57, 0xCD]);
+
+        // Set CIU_BitFraming TxLastBits = 7 so the next byte goes out as a
+        // 7-bit short frame.
+        pn532_transmit(card, &[0xD4, 0x08, 0x63, 0x33, 0x07])
+            .context("PN532 WriteRegister (BitFraming=7) failed")?;
+        let resp1 = pn532_transmit(card, &[0xD4, 0x42, 0x40])
+            .context("PN532 InCommunicateThru (unlock1) failed")?;
+
+        // Restore standard byte framing before sending the 8-bit half.
+        pn532_transmit(card, &[0xD4, 0x08, 0x63, 0x33, 0x00])
+            .context("PN532 WriteRegister (BitFraming=0) failed")?;
+
+        if !is_magic_ack(&resp1) {
+            return Ok(false);
+        }
+
+        let resp2 = pn532_transmit(card, &[0xD4, 0x42, 0x43])
+            .context("PN532 InCommunicateThru (unlock2) failed")?;
+        Ok(is_magic_ack(&resp2))
+    })();
+
+    // Always restore CRC handling so subsequent commands (verification,
+    // standard MFC, even Gen1a writes which use CRC) work normally.
+    let _ = pn532_transmit(card, &[0xD4, 0x08, 0x63, 0x02, 0x80, 0x63, 0x03, 0x80]);
+
+    outcome
+}
+
+/// Write one 16-byte block via the Gen1a backdoor. Assumes the session is
+/// already unlocked. Two-stage MIFARE write: command frame `A0 <block>`,
+/// expect ACK; data frame `<16 bytes>` (PN532 adds CRC), expect ACK.
+fn gen1a_write_block(card: &Card, block: u8, data: &[u8; 16]) -> Result<()> {
+    let resp1 = pn532_transmit(card, &[0xD4, 0x42, 0xA0, block])
+        .context("Gen1a write — command-frame transmit failed")?;
+    if !is_magic_ack(&resp1) {
+        return Err(anyhow!(
+            "Gen1a write block {} command NAK ({:02X?})",
+            block,
+            resp1
+        ));
+    }
+
+    let mut payload = Vec::with_capacity(2 + 16);
+    payload.extend_from_slice(&[0xD4, 0x42]);
+    payload.extend_from_slice(data);
+    let resp2 = pn532_transmit(card, &payload)
+        .context("Gen1a write — data-frame transmit failed")?;
+    if !is_magic_ack(&resp2) {
+        return Err(anyhow!(
+            "Gen1a write block {} data NAK ({:02X?})",
+            block,
+            resp2
+        ));
+    }
+    Ok(())
+}
+
+/// Attempt the full Gen1a write path:
+///
+/// - Skip silently on non-ACR122 readers (no way to do raw frames).
+/// - Open ONE pcsc session (the unlock state is volatile across reconnects,
+///   unlike standard MFC where one-session-per-sector avoids ACR122U
+///   firmware lockups; Gen1a writes don't auth, so the lockup risk doesn't
+///   apply here).
+/// - Probe the unlock; if it doesn't ACK, declare "not Gen1a" and let the
+///   caller fall through to the standard-auth path.
+/// - If the unlock ACKs, write all 64 blocks in this same session. We
+///   commit to Gen1a here — falling back mid-write would mix two write
+///   strategies on the same tag.
+/// - Verify by re-reading block 0 in a fresh session, authing with the key
+///   A we just wrote (extracted from the dump's sector 0 trailer). The
+///   factory key won't necessarily auth on the destination after we've
+///   replaced the trailer.
+fn try_gen1a_write(
+    reader_name: &str,
+    dump: &MifareDump,
+    progress: &mut dyn FnMut(u8),
+) -> Result<Option<WriteOutcome>> {
+    if !looks_like_acr122(reader_name) {
+        return Ok(None);
+    }
+
+    let card = connect_card(reader_name)?;
+    if !gen1a_unlock(&card)? {
+        return Ok(None);
+    }
+
+    let mut blocks_written = 0u8;
+    let mut blocks_skipped = 0u8;
+    for block in 0..64u8 {
+        let off = block as usize * 16;
+        let data: [u8; 16] = dump.bytes[off..off + 16].try_into().unwrap();
+        match gen1a_write_block(&card, block, &data) {
+            Ok(()) => blocks_written += 1,
+            Err(e) => {
+                log::debug!("gen1a write block {} failed: {}", block, e);
+                blocks_skipped += 1;
+            }
+        }
+        progress(block + 1);
+    }
+
+    // Drop this session before verification so the field is cold-reset and
+    // the tag enters a clean active state for the standard auth probe.
+    drop(card);
+
+    // Sector 0 trailer is at dump bytes [48..64); key A occupies bytes 48..54.
+    let key_a: [u8; 6] = dump.bytes[48..54].try_into().unwrap();
+    let uid_changed = verify_block0_with_key(reader_name, &dump.bytes[..16], key_a)
+        .unwrap_or(false);
+
+    Ok(Some(WriteOutcome {
+        blocks_written,
+        blocks_skipped,
+        uid_changed,
+        mode: WriteMode::Gen1aBackdoor,
+    }))
+}
+
+/// Like `verify_block0` but auths with a caller-supplied key A. The Gen1a
+/// path needs this because we may have just rewritten the sector trailer,
+/// so the destination's key A is now whatever the dump says, not
+/// necessarily the factory FFFFFFFFFFFF.
+fn verify_block0_with_key(
+    reader_name: &str,
+    expected_block0: &[u8],
+    key: [u8; 6],
+) -> Result<bool> {
+    let mut card = connect_card(reader_name)?;
+    if !try_auth(&mut card, key, KeyType::A, 0)? {
+        return Ok(false);
+    }
+    let actual = read_block(&card, 0)?;
+    Ok(actual[..] == *expected_block0)
 }
