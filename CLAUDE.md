@@ -11,11 +11,13 @@ GTK4 + libadwaita desktop app (Rust) for working with ISO-14443 / MIFARE RFID ta
 Arch / Arch-based:
 
 ```
-sudo pacman -S gtk4 libadwaita libnfc pcsclite ccid
+sudo pacman -S gtk4 libadwaita pcsclite ccid
 sudo systemctl enable --now pcscd
+# Only when building --features libnfc:
+sudo pacman -S cmake
 ```
 
-- **`libnfc`** — required only when building with `--features libnfc` (the primary NFC path). The `nfc1` crate links against `/usr/lib/libnfc.so`; `cargo check` with default features skips it.
+- **`cmake`** — required only when building with `--features libnfc`. The `nfc1-sys` crate vendors libnfc + libusb and compiles them statically via cmake, so the system `libnfc` package is *not* used (and isn't needed). `cargo check` with default features skips this entirely.
 - **`pcscd`** — daemon for the PC/SC backend. Must be running for PC/SC reader enumeration. Users may also need to be in the `plugdev` group or have a udev rule granting access to the reader's USB VID/PID (ACR122U is `072f:2200`).
 
 ## Build / run
