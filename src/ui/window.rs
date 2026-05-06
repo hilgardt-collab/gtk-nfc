@@ -22,8 +22,11 @@ struct UiState {
     dump_btn: gtk::Button,
     save_btn: gtk::Button,
     write_btn: gtk::Button,
-    // Content widgets.
-    stack: gtk::Stack,
+    // Content widgets. dump_page lets us hide/show the Dump tab in the
+    // ViewSwitcher based on whether a dump is loaded — there's nothing
+    // useful to navigate to until one exists.
+    view_stack: adw::ViewStack,
+    dump_page: adw::ViewStackPage,
     status_page: adw::StatusPage,
     dump_buffer: gtk::TextBuffer,
     toast_overlay: adw::ToastOverlay,
@@ -37,18 +40,23 @@ impl UiState {
         self.dump_btn.set_sensitive(has_reader);
         self.save_btn.set_sensitive(has_dump);
         self.write_btn.set_sensitive(has_reader && has_dump);
+        // Dump tab in the ViewSwitcher tracks dump availability — hidden
+        // entirely when there's nothing to show, so the switcher is just
+        // a single "Status" tab on a fresh launch.
+        self.dump_page.set_visible(has_dump);
     }
 
     fn show_status(&self, icon: &str, title: &str, description: &str) {
         self.status_page.set_icon_name(Some(icon));
         self.status_page.set_title(title);
         self.status_page.set_description(Some(description));
-        self.stack.set_visible_child_name("status");
+        self.view_stack.set_visible_child_name("status");
     }
 
     fn show_dump(&self, dump: &MifareDump) {
         self.dump_buffer.set_text(&format_dump(dump));
-        self.stack.set_visible_child_name("dump");
+        self.dump_page.set_visible(true);
+        self.view_stack.set_visible_child_name("dump");
     }
 
     fn show_toast(&self, message: &str) {
@@ -171,17 +179,34 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
         .hexpand(true)
         .build();
 
-    let stack = gtk::Stack::new();
-    stack.add_named(&status_page, Some("status"));
-    stack.add_named(&dump_scroll, Some("dump"));
-    stack.set_visible_child_name("status");
+    let view_stack = adw::ViewStack::new();
+    view_stack.add_titled_with_icon(
+        &status_page,
+        Some("status"),
+        "Status",
+        "dialog-information-symbolic",
+    );
+    let dump_page = view_stack.add_titled_with_icon(
+        &dump_scroll,
+        Some("dump"),
+        "Dump",
+        "view-list-symbolic",
+    );
+    dump_page.set_visible(false);
+    view_stack.set_visible_child_name("status");
+
+    let switcher = adw::ViewSwitcher::builder()
+        .stack(&view_stack)
+        .policy(adw::ViewSwitcherPolicy::Wide)
+        .build();
+    header.set_title_widget(Some(&switcher));
 
     let content_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .build();
     content_box.append(&action_bar);
     content_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    content_box.append(&stack);
+    content_box.append(&view_stack);
 
     // Toast overlay sits between the content box and the navigation page so
     // we can surface parse errors etc. without flipping the stack to the
@@ -215,7 +240,8 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
         dump_btn: dump_btn.clone(),
         save_btn: save_btn.clone(),
         write_btn: write_btn.clone(),
-        stack: stack.clone(),
+        view_stack: view_stack.clone(),
+        dump_page: dump_page.clone(),
         status_page: status_page.clone(),
         dump_buffer: dump_buffer.clone(),
         toast_overlay: toast_overlay.clone(),
@@ -359,7 +385,7 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
                     ),
                     Event::TagRead { reader, tag } => {
                         show_tag(&state.status_page, &reader, &tag);
-                        state.stack.set_visible_child_name("status");
+                        state.view_stack.set_visible_child_name("status");
                     }
                     Event::TagError { reader, message } => state.show_status(
                         "dialog-warning-symbolic",
