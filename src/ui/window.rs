@@ -30,6 +30,11 @@ struct UiState {
     status_page: adw::StatusPage,
     dump_buffer: gtk::TextBuffer,
     toast_overlay: adw::ToastOverlay,
+    // Sidebar saved-dumps section. The ListBox shows .mfd files in
+    // dumps_dir(); dump_paths is the parallel index from row position
+    // back to filesystem path (ListBox doesn't carry per-row data).
+    dump_list: gtk::ListBox,
+    dump_paths: RefCell<Vec<PathBuf>>,
 }
 
 impl UiState {
@@ -63,6 +68,13 @@ impl UiState {
         let toast = adw::Toast::new(message);
         toast.set_timeout(5);
         self.toast_overlay.add_toast(toast);
+    }
+
+    /// Re-scan dumps_dir() and rebuild the sidebar list. Cheap to call
+    /// — handful of dirent reads — so we just trigger it on app start
+    /// and after every successful save.
+    fn refresh_dump_list(&self) {
+        populate_dump_list(&self.dump_list, &self.dump_paths, &list_saved_dumps());
     }
 
     /// Re-parse the editable dump buffer back into a MifareDump. The
@@ -115,12 +127,27 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
         .css_classes(["navigation-sidebar"])
         .build();
     reader_list.set_placeholder(Some(&placeholder_row("No readers detected")));
+
+    let dump_list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::Single)
+        .css_classes(["navigation-sidebar"])
+        .build();
+    dump_list.set_placeholder(Some(&placeholder_row("No saved dumps")));
+
+    let sidebar_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .build();
+    sidebar_box.append(&section_header("Readers"));
+    sidebar_box.append(&reader_list);
+    sidebar_box.append(&section_header("Saved dumps"));
+    sidebar_box.append(&dump_list);
+
     let sidebar_scroll = gtk::ScrolledWindow::builder()
-        .child(&reader_list)
+        .child(&sidebar_box)
         .vexpand(true)
         .build();
     let sidebar_page = adw::NavigationPage::builder()
-        .title("Readers")
+        .title("Sources")
         .tag("readers")
         .child(&sidebar_scroll)
         .build();
@@ -245,6 +272,8 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
         status_page: status_page.clone(),
         dump_buffer: dump_buffer.clone(),
         toast_overlay: toast_overlay.clone(),
+        dump_list: dump_list.clone(),
+        dump_paths: RefCell::new(Vec::new()),
     });
 
     let row_ids: Rc<RefCell<Vec<ReaderId>>> = Rc::new(RefCell::new(Vec::new()));
@@ -275,6 +304,30 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
 
     {
         let state = Rc::clone(&state);
+        dump_list.connect_row_selected(move |_, row| {
+            let Some(row) = row else { return };
+            let i = row.index();
+            if i < 0 {
+                return;
+            }
+            let Some(path) = state.dump_paths.borrow().get(i as usize).cloned() else {
+                return;
+            };
+            match load_dump(&path) {
+                Ok(dump) => {
+                    state.show_dump(&dump);
+                    *state.current_dump.borrow_mut() = Some(dump);
+                    state.refresh_buttons();
+                }
+                Err(e) => {
+                    state.show_toast(&format!("Couldn't load {}: {}", path.display(), e));
+                }
+            }
+        });
+    }
+
+    {
+        let state = Rc::clone(&state);
         read_uid_btn.connect_clicked(move |_| {
             if let Some(reader) = state.selected_reader.borrow().clone() {
                 state.worker.send(Command::ReadTag { reader });
@@ -295,9 +348,12 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
         let state = Rc::clone(&state);
         let window = window.clone();
         load_btn.connect_clicked(move |_| {
+            let dir = dumps_dir();
+            let _ = std::fs::create_dir_all(&dir);
             let dialog = gtk::FileDialog::builder()
                 .title("Load .mfd dump")
                 .modal(true)
+                .initial_folder(&gtk::gio::File::for_path(&dir))
                 .build();
             let state = Rc::clone(&state);
             dialog.open(Some(&window), gtk::gio::Cancellable::NONE, move |res| {
@@ -329,10 +385,16 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
                     return;
                 }
             };
+            // Default dialog location to the saved-dumps directory; mkdir
+            // it so set_initial_folder has a real target. User can still
+            // navigate elsewhere — we just make the common case ergonomic.
+            let dir = dumps_dir();
+            let _ = std::fs::create_dir_all(&dir);
             let dialog = gtk::FileDialog::builder()
                 .title("Save .mfd dump")
                 .modal(true)
                 .initial_name("dump.mfd")
+                .initial_folder(&gtk::gio::File::for_path(&dir))
                 .build();
             let state = Rc::clone(&state);
             dialog.save(Some(&window), gtk::gio::Cancellable::NONE, move |res| {
@@ -341,8 +403,9 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
                     state.show_toast("Couldn't save: chosen location has no local path");
                     return;
                 };
-                if let Err(e) = std::fs::write(&path, &dump_bytes) {
-                    state.show_toast(&format!("Couldn't save dump: {}", e));
+                match std::fs::write(&path, &dump_bytes) {
+                    Ok(()) => state.refresh_dump_list(),
+                    Err(e) => state.show_toast(&format!("Couldn't save dump: {}", e)),
                 }
             });
         });
@@ -491,10 +554,72 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
     }
 
     worker.send(Command::ListReaders);
+    state.refresh_dump_list();
 
     unsafe { window.set_data("nfc-worker", worker) };
 
     window
+}
+
+/// Where Save dialogs default to and where the sidebar's "Saved dumps"
+/// section reads from. XDG data dir per-user — `~/.local/share/gtk-nfc/dumps`
+/// on a typical Linux setup.
+fn dumps_dir() -> PathBuf {
+    glib::user_data_dir().join("gtk-nfc").join("dumps")
+}
+
+/// Sorted list of `.mfd` files in `dumps_dir()`. Returns an empty Vec if
+/// the directory doesn't exist or can't be read; never errors — a missing
+/// dumps dir is the normal first-run state.
+fn list_saved_dumps() -> Vec<PathBuf> {
+    let dir = dumps_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("mfd"))
+        .collect();
+    out.sort();
+    out
+}
+
+fn populate_dump_list(
+    list: &gtk::ListBox,
+    paths_cell: &RefCell<Vec<PathBuf>>,
+    paths: &[PathBuf],
+) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+    let mut p = paths_cell.borrow_mut();
+    p.clear();
+    for path in paths {
+        let title = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("(unnamed)")
+            .to_string();
+        let row = adw::ActionRow::builder()
+            .title(&title)
+            .activatable(true)
+            .build();
+        list.append(&row);
+        p.push(path.clone());
+    }
+}
+
+fn section_header(text: &str) -> gtk::Label {
+    gtk::Label::builder()
+        .label(text)
+        .halign(gtk::Align::Start)
+        .css_classes(["heading"])
+        .margin_top(12)
+        .margin_bottom(6)
+        .margin_start(12)
+        .margin_end(12)
+        .build()
 }
 
 fn populate_reader_list(
