@@ -11,6 +11,7 @@ use std::thread;
 pub mod pcsc_backend;
 #[cfg(feature = "libnfc")]
 pub mod libnfc_backend;
+pub mod watcher;
 
 /// Which backend kind a reader came from. Determines which driver handles
 /// subsequent commands for that reader.
@@ -231,6 +232,13 @@ impl Worker {
 
     pub fn send(&self, cmd: Command) {
         let _ = self.cmd_tx.send(cmd);
+    }
+
+    /// A clone of the worker's command-input channel. Used by the
+    /// reader watcher so it can fire `Command::ReadTag` from its own
+    /// background thread without going through the GTK main loop.
+    pub fn cmd_sender(&self) -> mpsc::Sender<Command> {
+        self.cmd_tx.clone()
     }
 }
 

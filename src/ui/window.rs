@@ -7,8 +7,8 @@ use adw::prelude::*;
 use gtk::glib;
 
 use crate::nfc::{
-    self, Backend, Command, Event, KeyType, MifareDump, Reader, ReaderId, SectorRead, TagInfo,
-    WriteMode, Worker,
+    self, watcher::ReaderWatcher, Backend, Command, Event, KeyType, MifareDump, Reader, ReaderId,
+    SectorRead, TagInfo, WriteMode, Worker,
 };
 
 /// All the per-window state the event loop needs to mutate. Held in `Rc`s
@@ -35,6 +35,10 @@ struct UiState {
     // back to filesystem path (ListBox doesn't carry per-row data).
     dump_list: gtk::ListBox,
     dump_paths: RefCell<Vec<PathBuf>>,
+    // Per-reader auto-read watcher. Replaced when reader selection
+    // changes; None when no reader is selected or selection is libnfc
+    // (we only watch PC/SC, see watcher.rs).
+    watcher: RefCell<Option<ReaderWatcher>>,
 }
 
 impl UiState {
@@ -75,6 +79,18 @@ impl UiState {
     /// and after every successful save.
     fn refresh_dump_list(&self) {
         populate_dump_list(&self.dump_list, &self.dump_paths, &list_saved_dumps());
+    }
+
+    fn suspend_watcher(&self) {
+        if let Some(w) = self.watcher.borrow().as_ref() {
+            w.suspend();
+        }
+    }
+
+    fn resume_watcher(&self) {
+        if let Some(w) = self.watcher.borrow().as_ref() {
+            w.resume();
+        }
     }
 
     /// Re-parse the editable dump buffer back into a MifareDump. The
@@ -274,6 +290,7 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
         toast_overlay: toast_overlay.clone(),
         dump_list: dump_list.clone(),
         dump_paths: RefCell::new(Vec::new()),
+        watcher: RefCell::new(None),
     });
 
     let row_ids: Rc<RefCell<Vec<ReaderId>>> = Rc::new(RefCell::new(Vec::new()));
@@ -297,8 +314,17 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
                     row_ids.borrow().get(i as usize).cloned()
                 }
             });
-            *state.selected_reader.borrow_mut() = new;
+            *state.selected_reader.borrow_mut() = new.clone();
             state.refresh_buttons();
+
+            // Replace the auto-read watcher to track the new selection.
+            // Dropping the old one signals it to stop; spawning the new
+            // one starts polling immediately so a tag already on the
+            // reader gets read straight away.
+            *state.watcher.borrow_mut() = match new {
+                Some(reader) => ReaderWatcher::spawn(reader, state.worker.cmd_sender()),
+                None => None,
+            };
         });
     }
 
@@ -339,6 +365,7 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
         let state = Rc::clone(&state);
         dump_btn.connect_clicked(move |_| {
             if let Some(reader) = state.selected_reader.borrow().clone() {
+                state.suspend_watcher();
                 state.worker.send(Command::DumpTag { reader });
             }
         });
@@ -425,6 +452,7 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
                     return;
                 }
             };
+            state.suspend_watcher();
             state.worker.send(Command::WriteDump { reader, dump });
         });
     }
@@ -470,12 +498,16 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
                         state.show_dump(&dump);
                         *state.current_dump.borrow_mut() = Some(dump);
                         state.refresh_buttons();
+                        state.resume_watcher();
                     }
-                    Event::DumpError { reader, message } => state.show_status(
-                        "dialog-warning-symbolic",
-                        "Dump failed",
-                        &format!("{} — {}", reader.key, message),
-                    ),
+                    Event::DumpError { reader, message } => {
+                        state.show_status(
+                            "dialog-warning-symbolic",
+                            "Dump failed",
+                            &format!("{} — {}", reader.key, message),
+                        );
+                        state.resume_watcher();
+                    }
                     Event::WriteStarted { reader } => state.show_status(
                         "content-loading-symbolic",
                         "Writing tag…",
@@ -539,12 +571,16 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
                             )
                         };
                         state.show_status(icon, title, &desc);
+                        state.resume_watcher();
                     }
-                    Event::WriteError { reader, message } => state.show_status(
-                        "dialog-warning-symbolic",
-                        "Write failed",
-                        &format!("{} — {}", reader.key, message),
-                    ),
+                    Event::WriteError { reader, message } => {
+                        state.show_status(
+                            "dialog-warning-symbolic",
+                            "Write failed",
+                            &format!("{} — {}", reader.key, message),
+                        );
+                        state.resume_watcher();
+                    }
                     Event::BackendError { backend, message } => {
                         log::warn!("backend {:?}: {}", backend, message);
                     }
